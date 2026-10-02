@@ -109,8 +109,8 @@ def parse_pdf(file_path):
             for d in target_dates:
                 ev = Event()
                 ev.add('summary', content)
-                ev.add('dtstart', TZ.localize(datetime.combine(d, time(int(h_start), int(m_start))))))
-                ev.add('dtend', TZ.localize(datetime.combine(d, time(int(h_end), int(m_end))))))
+                ev.add('dtstart', TZ.localize(datetime.combine(d, time(int(h_start), int(m_start)))))
+                ev.add('dtend', TZ.localize(datetime.combine(d, time(int(h_end), int(m_end)))))
                 cal.add_component(ev)
 
     with open(OUTPUT_ICS, 'wb') as f:
