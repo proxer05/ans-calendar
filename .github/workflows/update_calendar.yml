@@ -1,0 +1,47 @@
+name: Update Schedule Calendar
+
+on:
+  schedule:
+    # Uruchamiaj w każdy poniedziałek o 05:00 UTC
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ics:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pdfplumber icalendar pytz
+
+      - name: Run calendar parser
+        run: |
+          python parse_schedule.py
+
+      - name: Upload ICS as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: google-calendar-ics
+          path: plan_automatyka_1.ics
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: latest-schedule
+          name: Latest ANS Konin AiR Schedule
+          files: plan_automatyka_1.ics
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
