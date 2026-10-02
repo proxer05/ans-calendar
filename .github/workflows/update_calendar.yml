@@ -6,11 +6,19 @@ on:
     - cron: "0 5 * * 1"   # every Monday 05:00 UTC - picks up changes to the PDF
 
 permissions:
-  contents: write         # needed to commit plan.ics back to the repo
+  contents: write         # needed to publish the release assets
+
+concurrency:
+  group: plan-ics
+  cancel-in-progress: false   # let a running build finish rather than restart it
 
 env:
   PLAN_URL: "https://ans.konin.pl/images/MiA/AiR%20plany%202026_2027/plan%20automatyka%201.pdf"
   CAL_NAME: "AiR rok I sem I 2026/27"
+  # Rolling tag: one release that is always replaced with the newest plan.
+  # Keeps a stable subscribe URL, which a per-run dated tag would not:
+  #   https://github.com/proxer05/ans-calendar/releases/latest/download/plan.ics
+  RELEASE_TAG: "plan"
 
 jobs:
   build:
@@ -30,7 +38,10 @@ jobs:
         run: curl -fsSL --retry 3 -o plan.pdf "$PLAN_URL"
 
       - name: Build plan.ics
-        run: python plan_to_ics.py plan.pdf -o plan.ics --dump-text plan.txt --calname "$CAL_NAME"
+        run: |
+          # tee would mask the script's exit status without pipefail
+          set -o pipefail
+          python plan_to_ics.py plan.pdf -o plan.ics --dump-text plan.txt --calname "$CAL_NAME" | tee build.log
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -39,10 +50,54 @@ jobs:
           path: |
             plan.ics
             plan.txt
+            build.log
 
-      - name: Commit plan.ics if changed
+      - name: Compare against the published release
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add plan.ics
-          git diff --cached --quiet || (git commit -m "Update timetable ICS" && git push)
+          new=$(sha256sum plan.ics | cut -d' ' -f1)
+          old=""
+          if gh release download "$RELEASE_TAG" --pattern plan.ics --dir prev --clobber >/dev/null 2>&1; then
+            old=$(sha256sum prev/plan.ics | cut -d' ' -f1)
+          fi
+          if [ "$new" = "$old" ]; then
+            echo "plan.ics is unchanged since the last release - nothing to publish"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "plan.ics changed: ${old:-<no release yet>} -> $new"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish release assets
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "### $CAL_NAME"
+            echo
+            echo "Generated $(date -u '+%Y-%m-%d %H:%M UTC') from \`$PLAN_URL\`."
+            echo
+            echo "Subscribe: https://github.com/${{ github.repository }}/releases/latest/download/plan.ics"
+            echo
+            echo "SHA-256: \`$(sha256sum plan.ics | cut -d' ' -f1)\`"
+            echo
+            echo "Build output:"
+            echo
+            echo '```'
+            grep -E '^(Wrote|::warning::)' build.log || true
+            echo '```'
+          } > notes.md
+          cat notes.md
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" plan.ics plan.txt build.log --clobber
+            # move the rolling tag so it still points at the commit that built these assets
+            gh release edit "$RELEASE_TAG" \
+              --title "$CAL_NAME" --notes-file notes.md --latest --target "$GITHUB_SHA"
+          else
+            gh release create "$RELEASE_TAG" plan.ics plan.txt build.log \
+              --title "$CAL_NAME" --notes-file notes.md --latest
+          fi
