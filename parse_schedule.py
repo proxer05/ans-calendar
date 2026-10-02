@@ -1,183 +1,370 @@
-import os
+#!/usr/bin/env python3
+"""
+Convert an ANS Konin timetable PDF ("PLAN ZAJĘĆ") into an .ics file
+that can be imported into Google Calendar.
+
+How the PDF is interpreted
+--------------------------
+* Day headers:  Poniedziałek / Wtorek / Środa / Czwartek / Piątek ...
+* Entry lines:  "<grid slot> [<real time>] Subject - teacher - wyk. TN 109t"
+    - if a line has two time ranges, the LAST one is the real class time
+      (the first one is just the grid row label)
+    - TN / TP    -> odd / even weeks, dates come from the legend at the bottom
+    - ter.: ...  -> explicit list of dates, e.g. "18,25.11; 2,9,16.12"
+    - no marker  -> every teaching day (union of the TN and TP legend dates,
+                    so free days / holidays are skipped automatically)
+    - room       -> tokens like 109t, 17t, Aula
+* Legend lines: "TN – tygodnie nieparzyste: 1-2.10.2026; 12-16.10.2026; ..."
+
+Usage
+-----
+    python plan_to_ics.py plan.pdf -o plan.ics [--dump-text plan.txt]
+    python plan_to_ics.py --from-text plan.txt -o plan.ics     # for debugging
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
 import re
-import urllib.request
-from datetime import datetime, date, time
-import pdfplumber
-from icalendar import Calendar, Event
-import pytz
+import sys
+from datetime import date, datetime, timedelta
 
-PDF_URL = "https://ans.konin.pl/images/MiA/AiR%20plany%202026_2027/plan%20automatyka%201.pdf"
-LOCAL_PDF = "plan.pdf"
-OUTPUT_ICS = "plan_automatyka_1.ics"
-TZ = pytz.timezone("Europe/Warsaw")
+DAYS = {
+    "poniedziałek": 0, "wtorek": 1, "środa": 2, "czwartek": 3,
+    "piątek": 4, "sobota": 5, "niedziela": 6,
+}
+TIME = r"\d{1,2}[.:]\d{2}\s*-\s*\d{1,2}[.:]\d{2}"
+TIME_RE = re.compile(rf"^\s*({TIME})\s*")
+ROOM_RE = re.compile(r"\b(\d{1,3}t|Aula)\b")
+TYPE_TOKEN = r"(?:wyk|ćw|lab|konw|proj|sem)\."
+TYPE_RE = re.compile(rf"({TYPE_TOKEN}(?:\s*/\s*{TYPE_TOKEN})*)")
+LEGEND_RE = re.compile(r"^\s*(TN|TP)\s*[–-]\s*[^:]*:\s*(.*)$")
+RANGE_RE = re.compile(
+    r"(\d{1,2})(?:\.(\d{1,2}))?\.?\s*-\s*(\d{1,2})\.(\d{1,2})\.(\d{4})"
+)
+SINGLE_RE = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{4})")
 
-def download_pdf(url, dest):
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req) as resp, open(dest, 'wb') as f:
-        f.write(resp.read())
 
-def parse_date_ranges(line_str):
-    dates = []
-    chunks = [c.strip() for c in line_str.split(';') if c.strip()]
-    for chunk in chunks:
-        m_range = re.search(r'(\d+)\s*-\s*(\d+)\.(\d{1,2})\.(\d{4})', chunk)
-        if m_range:
-            d_start, d_end, month, year = map(int, m_range.groups())
-            for d in range(d_start, d_end + 1):
-                try:
-                    dates.append(date(year, month, d))
-                except ValueError:
-                    pass
+# --------------------------------------------------------------------------
+# PDF -> text
+# --------------------------------------------------------------------------
+def pdf_to_text(path: str) -> str:
+    import pdfplumber
+
+    with pdfplumber.open(path) as pdf:
+        return "\n".join((page.extract_text() or "") for page in pdf.pages)
+
+
+# --------------------------------------------------------------------------
+# Date helpers
+# --------------------------------------------------------------------------
+def daterange(a: date, b: date):
+    d = a
+    while d <= b:
+        yield d
+        d += timedelta(days=1)
+
+
+def parse_legend_dates(s: str) -> set[date]:
+    """'1-2.10.2026; 30.11.-4.12.2026; ...' -> set of dates."""
+    out: set[date] = set()
+    for m in RANGE_RE.finditer(s):
+        d1, m1, d2, m2, y = m.groups()
+        end = date(int(y), int(m2), int(d2))
+        start = date(int(y), int(m1 or m2), int(d1))
+        if start > end:  # range crossing New Year
+            start = date(int(y) - 1, int(m1 or m2), int(d1))
+        out.update(daterange(start, end))
+    rest = RANGE_RE.sub(" ", s)
+    for m in SINGLE_RE.finditer(rest):
+        d, mo, y = map(int, m.groups())
+        out.add(date(y, mo, d))
+    return out
+
+
+def parse_terms(s: str, acad_year: int, warnings: list[str]) -> set[date]:
+    """'18,25.11; 2,9,16.12; 8.01' -> set of dates (Sep-Dec = start year)."""
+    out: set[date] = set()
+    for seg in s.split(";"):
+        seg = seg.strip()
+        if not seg:
             continue
-        m_single = re.search(r'(\d+)\.(\d{1,2})\.(\d{4})', chunk)
-        if m_single:
-            d, month, year = map(int, m_single.groups())
-            try:
-                dates.append(date(year, month, d))
-            except ValueError:
-                pass
-    return dates
+        m = re.fullmatch(r"([\d,\s]+)\.(\d{1,2})\.?(?:(\d{4}))?", seg)
+        if not m:
+            warnings.append(f"Cannot parse date segment {seg!r} in 'ter.:' list")
+            continue
+        month = int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else (
+            acad_year if month >= 9 else acad_year + 1
+        )
+        for d in re.findall(r"\d+", m.group(1)):
+            out.add(date(year, month, int(d)))
+    return out
 
-def extract_footer_weeks(text):
-    tn_dates = set()
-    tp_dates = set()
-    for line in text.splitlines():
-        line_clean = line.strip()
-        if "TN – tygodnie nieparzyste" in line_clean or "TN -" in line_clean:
-            after_colon = line_clean.split(":", 1)[-1]
-            tn_dates.update(parse_date_ranges(after_colon))
-        elif "TP – tygodnie parzyste" in line_clean or "TP -" in line_clean:
-            after_colon = line_clean.split(":", 1)[-1]
-            tp_dates.update(parse_date_ranges(after_colon))
-    return tn_dates, tp_dates
 
-def parse_explicit_dates(text, default_year=2026):
-    dates = []
-    ter_match = re.search(r'ter\.?:\s*([^\n\r]+)', text, re.IGNORECASE)
-    if not ter_match:
-        return dates
+# --------------------------------------------------------------------------
+# Text -> entries
+# --------------------------------------------------------------------------
+def clean_time(t: str) -> tuple[int, int, int, int]:
+    h1, m1, h2, m2 = map(int, re.findall(r"\d+", t))
+    return h1, m1, h2, m2
 
-    raw_part = ter_match.group(1).split("Aula")[0].strip()
-    segments = re.findall(r'([\d\s,]+)\.(\d{1,2})', raw_part)
-    for days_str, month_str in segments:
-        m = int(month_str)
-        yr = default_year if m >= 9 else default_year + 1
-        day_numbers = re.findall(r'\d+', days_str)
-        for d in day_numbers:
-            try:
-                dates.append(date(yr, m, int(d)))
-            except ValueError:
-                pass
-    return dates
 
-def parse_time_override(text, default_start, default_end):
-    m = re.search(r'(\d{1,2})[\.:](\d{2})\s*[-–]\s*(\d{1,2})[\.:](\d{2})', text)
-    if m:
-        return time(int(m.group(1)), int(m.group(2))), time(int(m.group(3)), int(m.group(4)))
-    return default_start, default_end
+def parse_text(text: str, fb_start: date | None, fb_end: date | None):
+    warnings: list[str] = []
+    lines = [ln.rstrip() for ln in text.splitlines()]
 
-def parse_schedule():
-    with pdfplumber.open(LOCAL_PDF) as pdf:
-        full_text = "\n".join([page.extract_text(layout=False) or "" for page in pdf.pages])
-        tn_dates, tp_dates = extract_footer_weeks(full_text)
-        all_semester_dates = tn_dates.union(tp_dates)
+    # academic year
+    m = re.search(r"(\d{4})\s*/\s*(\d{4})", text)
+    acad_year = int(m.group(1)) if m else None
 
-        cal = Calendar()
-        cal.add('prodid', '-//ANS Konin AiR Calendar//PL')
-        cal.add('version', '2.0')
+    # ---- pass 1: legend + raw entries ------------------------------------
+    legend: dict[str, str] = {"TN": "", "TP": ""}
+    legend_key: str | None = None
+    raw: list[dict] = []
+    day: int | None = None
 
-        page = pdf.pages[0]
+    for ln in lines:
+        stripped = ln.strip()
+        if not stripped:
+            continue
 
-        # 1. Wyciągamy wszystkie linie poziome siatki (granice slotów)
-        h_lines = sorted(list(set([round(edge['top'], 1) for edge in page.horizontal_edges if edge['width'] > 200])))
-        
-        # Standardowy układ 5 dni po 6 slotów (lub granice wyznaczone liniami tabeli)
-        # Rezerwowy fallback do standardowych 30 slotów (5 dni * 6 godzin)
-        DEFAULT_SLOT_TIMES = [
-            (time(8, 0), time(9, 30)),
-            (time(9, 45), time(11, 15)),
-            (time(11, 30), time(13, 0)),
-            (time(13, 30), time(15, 0)),
-            (time(15, 15), time(16, 45)),
-            (time(17, 0), time(18, 30))
+        lm = LEGEND_RE.match(stripped)
+        if lm:
+            legend_key = lm.group(1)
+            legend[legend_key] += " " + lm.group(2)
+            continue
+        if legend_key:  # wrapped legend line
+            legend[legend_key] += " " + stripped
+            continue
+
+        low = stripped.lower().rstrip(":")
+        if low in DAYS:
+            day = DAYS[low]
+            continue
+        if day is None:
+            continue
+
+        tm = TIME_RE.match(stripped)
+        if tm:
+            raw.append({"day": day, "text": stripped})
+        elif raw and raw[-1]["day"] == day and not stripped.startswith("Godz"):
+            raw[-1]["text"] += " " + stripped  # continuation of wrapped cell
+
+    parity = {k: parse_legend_dates(v) for k, v in legend.items()}
+    all_days = parity["TN"] | parity["TP"]
+
+    if acad_year is None:
+        acad_year = min(all_days).year if all_days else date.today().year
+
+    if not all_days:
+        if fb_start and fb_end:
+            all_days = set(daterange(fb_start, fb_end))
+            warnings.append("No TN/TP legend found - using --start/--end range")
+        else:
+            warnings.append("No TN/TP legend found and no --start/--end given")
+
+    # ---- pass 2: build events -------------------------------------------
+    events = []
+    for r in raw:
+        rest = r["text"]
+        times = []
+        while True:
+            tm = TIME_RE.match(rest)
+            if not tm:
+                break
+            times.append(tm.group(1))
+            rest = rest[tm.end():]
+        body = " ".join(rest.split())
+        if not body:
+            continue  # empty grid row
+        h1, m1, h2, m2 = clean_time(times[-1])
+
+        terms_raw = None
+        tm = re.search(r"\bter\.?:\s*(.*)$", body)
+        room_m = ROOM_RE.search(body)
+        room = room_m.group(1) if room_m else ""
+        if room_m:
+            body = (body[:room_m.start()] + body[room_m.end():]).strip()
+            # re-run after room removal so 'ter.:' text does not contain it
+            tm = re.search(r"\bter\.?:\s*(.*)$", body)
+        if tm:
+            terms_raw = tm.group(1)
+            body = body[:tm.start()].strip()
+        if not room:  # bare trailing room number, e.g. "... Skwarczyńska 109"
+            bm = re.search(r"\s(\d{2,3})$", body)
+            if bm:
+                room = bm.group(1)
+                body = body[:bm.start()].strip()
+
+        pm = re.search(r"\b(TN|TP)\b", body)
+        par = pm.group(1) if pm else None
+        if pm:
+            body = (body[:pm.start()] + body[pm.end():]).strip()
+
+        typ = ""
+        ty = TYPE_RE.search(body)
+        if ty:
+            typ = ty.group(1)
+            body = (body[:ty.start()] + body[ty.end():]).strip()
+
+        body = re.sub(r"(\s+[-–])+\s*$", "", " ".join(body.split()))
+        parts = [p.strip() for p in re.split(r"\s+[-–]\s+", body) if p.strip()]
+        if not parts:
+            warnings.append(f"Skipped unparsable line: {r['text']!r}")
+            continue
+        subject, teacher = parts[0], ", ".join(parts[1:])
+
+        if terms_raw:
+            dates = sorted(parse_terms(terms_raw, acad_year, warnings))
+            for d in dates:
+                if d.weekday() != r["day"]:
+                    warnings.append(
+                        f"{subject}: {d} is not the expected weekday"
+                    )
+            if not dates:
+                warnings.append(f"{subject}: 'ter.:' present but no dates parsed")
+        elif par:
+            dates = sorted(d for d in parity[par] if d.weekday() == r["day"])
+        else:
+            dates = sorted(d for d in all_days if d.weekday() == r["day"])
+
+        for d in dates:
+            events.append({
+                "subject": subject, "teacher": teacher, "type": typ,
+                "room": room, "parity": par, "date": d,
+                "start": datetime(d.year, d.month, d.day, h1, m1),
+                "end": datetime(d.year, d.month, d.day, h2, m2),
+            })
+
+    events.sort(key=lambda e: e["start"])
+    return events, warnings
+
+
+# --------------------------------------------------------------------------
+# ICS writer
+# --------------------------------------------------------------------------
+VTIMEZONE = """BEGIN:VTIMEZONE
+TZID:Europe/Warsaw
+BEGIN:STANDARD
+DTSTART:19701025T030000
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU
+TZNAME:CET
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:19700329T020000
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0200
+RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU
+TZNAME:CEST
+END:DAYLIGHT
+END:VTIMEZONE"""
+
+
+def esc(s: str) -> str:
+    return (s.replace("\\", "\\\\").replace(";", "\\;")
+             .replace(",", "\\,").replace("\n", "\\n"))
+
+
+def fold(line: str) -> str:
+    """RFC 5545 line folding at 75 octets."""
+    out, cur = [], ""
+    for ch in line:
+        if len((cur + ch).encode("utf-8")) > 75:
+            out.append(cur)
+            cur = " " + ch
+        else:
+            cur += ch
+    out.append(cur)
+    return "\r\n".join(out)
+
+
+def build_ics(events, calname: str) -> str:
+    # Stable DTSTAMP so the file only changes when the timetable changes.
+    stamp = (min(e["start"] for e in events) if events
+             else datetime(2000, 1, 1)).strftime("%Y%m%dT000000Z")
+    L = [
+        "BEGIN:VCALENDAR", "VERSION:2.0",
+        "PRODID:-//plan-to-ics//ANS Konin//PL", "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH", f"X-WR-CALNAME:{esc(calname)}",
+        "X-WR-TIMEZONE:Europe/Warsaw", *VTIMEZONE.splitlines(),
+    ]
+    for e in events:
+        summary = e["subject"] + (f" ({e['type']})" if e["type"] else "")
+        desc = []
+        if e["teacher"]:
+            desc.append(f"Prowadzący: {e['teacher']}")
+        if e["parity"]:
+            desc.append("Tydzień: " + ("nieparzysty" if e["parity"] == "TN"
+                                       else "parzysty"))
+        uid_src = f"{e['subject']}|{e['type']}|{e['start'].isoformat()}"
+        uid = hashlib.sha1(uid_src.encode()).hexdigest()[:20] + "@plan-to-ics"
+        L += [
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"DTSTAMP:{stamp}",
+            f"DTSTART;TZID=Europe/Warsaw:{e['start']:%Y%m%dT%H%M%S}",
+            f"DTEND;TZID=Europe/Warsaw:{e['end']:%Y%m%dT%H%M%S}",
+            f"SUMMARY:{esc(summary)}",
         ]
+        if e["room"]:
+            L.append(f"LOCATION:{esc('sala ' + e['room'] if e['room'] != 'Aula' else 'Aula')}")
+        if desc:
+            L.append(f"DESCRIPTION:{esc(chr(10).join(desc))}")
+        L.append("END:VEVENT")
+    L.append("END:VCALENDAR")
+    return "\r\n".join(fold(x) for x in L) + "\r\n"
 
-        # Fallback na wypadek gdyby linie nie zostały precyzyjnie wykryte:
-        # Wyciągamy tabele z explicit vertical/horizontal strategies
-        extracted_tables = page.extract_tables({
-            "vertical_strategy": "lines",
-            "horizontal_strategy": "lines",
-            "snap_y_tolerance": 4,
-            "intersection_y_tolerance": 4
-        })
 
-        if not extracted_tables or len(extracted_tables[0]) < 10:
-            # Fallback bez sztywnych linii
-            extracted_tables = page.extract_tables()
+# --------------------------------------------------------------------------
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("pdf", nargs="?", help="timetable PDF")
+    ap.add_argument("--from-text", help="parse an already extracted .txt instead")
+    ap.add_argument("-o", "--output", default="plan.ics")
+    ap.add_argument("--calname", default="Plan zajęć")
+    ap.add_argument("--dump-text", help="write the extracted PDF text here")
+    ap.add_argument("--start", help="fallback semester start YYYY-MM-DD")
+    ap.add_argument("--end", help="fallback semester end YYYY-MM-DD")
+    a = ap.parse_args()
 
-        # Spłaszczamy wiersze tabeli
-        flat_rows = []
-        for t in extracted_tables:
-            for r in t:
-                flat_rows.append([cell.strip() if cell else "" for cell in r])
+    if a.from_text:
+        text = open(a.from_text, encoding="utf-8").read()
+    elif a.pdf:
+        text = pdf_to_text(a.pdf)
+    else:
+        ap.error("give a PDF path or --from-text")
 
-        # Przypisujemy wiersze do dni (5 dni, każdy ma 6 slotów godzinowych)
-        # Filtrujemy wiersze nagłówkowe i stopki
-        slot_rows = []
-        for r in flat_rows:
-            row_str = " ".join(r)
-            if "kierunek" in row_str.lower() or "plan zajęć" in row_str.lower() or "tygodnie" in row_str.lower():
-                continue
-            # Wiersz musi mieć co najmniej godzinę lub treść zajęć
-            if any(re.search(r'\d{1,2}[\.:]\d{2}', c) for c in r):
-                slot_rows.append(r)
+    if a.dump_text:
+        with open(a.dump_text, "w", encoding="utf-8") as f:
+            f.write(text)
 
-        # Jeśli mamy 30 slotów (6 slotów x 5 dni roboczych)
-        for idx, row in enumerate(slot_rows):
-            day_idx = min(idx // 6, 4)  # 0=Pn, 1=Wt, 2=Śr, 3=Czw, 4=Pt
-            time_idx = idx % 6
-            default_start, default_end = DEFAULT_SLOT_TIMES[time_idx]
+    fb_s = date.fromisoformat(a.start) if a.start else None
+    fb_e = date.fromisoformat(a.end) if a.end else None
+    events, warnings = parse_text(text, fb_s, fb_e)
 
-            # Sprawdzamy komórki z zajęciami
-            for cell in set(row):
-                if not cell or len(cell) < 4:
-                    continue
-                # Pomijamy komórkę będącą czystą godziną wiersza (np. 8.00-9.30)
-                if re.match(r'^\d{1,2}[\.:]\d{2}\s*[-–]\s*\d{1,2}[\.:]\d{2}$', cell):
-                    continue
-                if cell.lower() in ["poniedziałek", "wtorek", "środa", "czwartek", "piątek"]:
-                    continue
+    for w in warnings:
+        print(f"::warning::{w}")  # shows up as annotation in GitHub Actions
 
-                start_t, end_t = parse_time_override(cell, default_start, default_end)
-                explicit = parse_explicit_dates(cell)
+    if not events:
+        print("ERROR: no events produced - check the extracted text", file=sys.stderr)
+        return 1
 
-                if explicit:
-                    target_dates = explicit
-                else:
-                    is_tn = bool(re.search(r'\bTN\b', cell))
-                    is_tp = bool(re.search(r'\bTP\b', cell))
+    with open(a.output, "w", encoding="utf-8", newline="") as f:
+        f.write(build_ics(events, a.calname))
 
-                    if is_tn:
-                        target_dates = [d for d in tn_dates if d.weekday() == day_idx]
-                    elif is_tp:
-                        target_dates = [d for d in tp_dates if d.weekday() == day_idx]
-                    else:
-                        target_dates = [d for d in all_semester_dates if d.weekday() == day_idx]
+    print(f"Wrote {len(events)} events to {a.output}")
+    seen = {}
+    for e in events:
+        seen.setdefault(e["subject"], 0)
+        seen[e["subject"]] += 1
+    for k, v in seen.items():
+        print(f"  {v:3d} x {k}")
+    return 0
 
-                clean_title = re.sub(r'^\d{1,2}[\.:]\d{2}\s*[-–]\s*\d{1,2}[\.:]\d{2}\s*', '', cell).strip()
-                clean_title = re.sub(r'\s+', ' ', clean_title)
-
-                for ev_date in sorted(target_dates):
-                    ev = Event()
-                    ev.add('summary', clean_title)
-                    ev.add('dtstart', TZ.localize(datetime.combine(ev_date, start_t)))
-                    ev.add('dtend', TZ.localize(datetime.combine(ev_date, end_t)))
-                    cal.add_component(ev)
-
-        with open(OUTPUT_ICS, 'wb') as f:
-            f.write(cal.to_ical())
-        print(f"Wygenerowano ICS z {len(cal.subcomponents)} zdarzeniami.")
 
 if __name__ == "__main__":
-    download_pdf(PDF_URL, LOCAL_PDF)
-    parse_schedule()
+    sys.exit(main())
