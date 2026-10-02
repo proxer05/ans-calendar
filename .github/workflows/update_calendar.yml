@@ -2,7 +2,6 @@ name: Update Schedule Calendar
 
 on:
   schedule:
-    # Uruchamiaj w każdy poniedziałek o 05:00 UTC
     - cron: '0 5 * * 1'
   workflow_dispatch:
 
@@ -10,11 +9,13 @@ permissions:
   contents: write
 
 jobs:
-  build-ics:
+  build-and-release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,12 +37,28 @@ jobs:
           name: google-calendar-ics
           path: plan_automatyka_1.ics
 
-      - name: Publish to GitHub Release
-        uses: softprops/action-gh-release@v2
-        if: github.ref == 'refs/heads/main'
-        with:
-          tag_name: latest-schedule
-          name: Latest ANS Konin AiR Schedule
-          files: plan_automatyka_1.ics
+      - name: Update or Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Sprawdź czy plik został poprawnie wygenerowany
+          if [ ! -f "plan_automatyka_1.ics" ]; then
+            echo "Error: plan_automatyka_1.ics not found!"
+            exit 1
+          fi
+
+          TAG="latest-schedule"
+          TITLE="Latest ANS Konin AiR Schedule"
+
+          # Sprawdzenie czy Release już istnieje
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Updating existing release..."
+            # --clobber wymusza nadpisanie pliku o tej samej nazwie
+            gh release upload "$TAG" plan_automatyka_1.ics --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes "Updated on $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          else
+            echo "Creating new release..."
+            gh release create "$TAG" plan_automatyka_1.ics \
+              --title "$TITLE" \
+              --notes "Generated automatically on $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          fi
