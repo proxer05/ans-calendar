@@ -30,7 +30,7 @@ jobs:
         run: curl -fsSL --retry 3 -o plan.pdf "$PLAN_URL"
 
       - name: Build plan.ics
-        run: python scripts/plan_to_ics.py plan.pdf -o plan.ics --dump-text plan.txt --calname "$CAL_NAME"
+        run: python plan_to_ics.py plan.pdf -o plan.ics --dump-text plan.txt --calname "$CAL_NAME"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
