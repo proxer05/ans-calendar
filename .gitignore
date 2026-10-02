@@ -1,0 +1,9 @@
+# Build outputs. The workflow publishes these as release assets instead of
+# committing them, so they should never end up in the repository.
+plan.ics
+plan.txt
+plan.pdf
+build.log
+notes.md
+
+__pycache__/
