@@ -101,3 +101,16 @@ jobs:
             gh release create "$RELEASE_TAG" plan.ics plan.txt build.log \
               --title "$CAL_NAME" --notes-file notes.md --latest
           fi
+
+      # The release is for humans downloading the file. Subscribing calendar
+      # apps needs plan.ics committed instead: raw.githubusercontent serves it
+      # as text/plain with max-age=300, whereas a release asset comes back as
+      # application/octet-stream + Content-Disposition: attachment from a CDN
+      # cache, which some clients refuse to poll and which can serve stale
+      # copies after the asset is clobbered.
+      - name: Commit plan.ics as the subscription feed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add plan.ics
+          git diff --cached --quiet || (git commit -m "Update timetable ICS" && git push)

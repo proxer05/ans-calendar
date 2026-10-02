@@ -1,9 +1,13 @@
-# Build outputs. The workflow publishes these as release assets instead of
-# committing them, so they should never end up in the repository.
-plan.ics
+# Intermediate build outputs. The workflow publishes these as release assets
+# and never commits them, so they should not end up in the repository.
 plan.txt
 plan.pdf
 build.log
 notes.md
+
+# plan.ics is deliberately NOT ignored: it is committed so that the raw URL
+# (raw.githubusercontent.com) can serve it as a polling subscription feed.
+# Release assets are served as application/octet-stream with an attachment
+# disposition and are CDN-cached, which breaks calendar subscriptions.
 
 __pycache__/
