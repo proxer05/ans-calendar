@@ -1,7 +1,7 @@
 import os
 import re
 import urllib.request
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time
 import pdfplumber
 from icalendar import Calendar, Event
 import pytz
@@ -11,175 +11,197 @@ LOCAL_PDF = "plan.pdf"
 OUTPUT_ICS = "plan_automatyka_1.ics"
 TZ = pytz.timezone("Europe/Warsaw")
 
-# Zakres semestru zimowego (do generowania powtarzalnych zajęć)
-SEMESTER_START = date(2026, 10, 1)
-SEMESTER_END = date(2027, 2, 15)
-
-DAYS = ["poniedziałek", "wtorek", "środa", "czwartek", "piątek"]
+DAY_NAMES = {
+    "poniedziałek": 0,
+    "wtorek": 1,
+    "środa": 2,
+    "czwartek": 3,
+    "piątek": 4,
+}
 
 def download_pdf(url, dest):
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(req) as resp, open(dest, 'wb') as f:
         f.write(resp.read())
 
-def parse_explicit_dates(text, default_year=2026):
-    """Wyciąga daty z formatu np.: ter.: 14,21,28.10; 4,18.11; 2,9,16.12; 13,20.01"""
-    found_dates = []
-    # Szukamy fragmentów po 'ter.' lub 'terminy:'
-    ter_match = re.search(r'ter(?:m|\.|\:)?\s*:?\s*([^;\n]+(?:\s*;\s*[^;\n]+)*)', text, re.IGNORECASE)
-    if not ter_match:
-        return found_dates
-
-    raw = ter_match.group(1)
-    # Rozbijamy po średnikach lub grupach z kropką (np. "14,21.10", "4,18.11")
-    chunks = re.findall(r'(\d[\d\s,]*)\.(\d{1,2})', raw)
-    for days_str, month_str in chunks:
-        m = int(month_str)
-        yr = default_year if m >= 9 else default_year + 1
-        days = re.findall(r'\d+', days_str)
-        for d in days:
+def parse_date_ranges(line_str):
+    """
+    Parsuje zakresy dat ze stopki TN/TP, np:
+    '1-2.10.2026; 12-16.10.2026; 7-8.01.2027;'
+    """
+    dates = []
+    chunks = [c.strip() for c in line_str.split(';') if c.strip()]
+    for chunk in chunks:
+        # Zakres dni: DD-DD.MM.YYYY
+        m_range = re.search(r'(\d+)\s*-\s*(\d+)\.(\d{1,2})\.(\d{4})', chunk)
+        if m_range:
+            d_start, d_end, month, year = map(int, m_range.groups())
+            for d in range(d_start, d_end + 1):
+                try:
+                    dates.append(date(year, month, d))
+                except ValueError:
+                    pass
+            continue
+        # Pojedynczy dzień: DD.MM.YYYY
+        m_single = re.search(r'(\d+)\.(\d{1,2})\.(\d{4})', chunk)
+        if m_single:
+            d, month, year = map(int, m_single.groups())
             try:
-                found_dates.append(date(yr, m, int(d)))
+                dates.append(date(year, month, d))
             except ValueError:
                 pass
-    return found_dates
+    return dates
 
-def parse_time_range(text):
-    """Wyciąga godzinę startu i końca, np. 8.00-9.30 lub 08:00 - 09:30"""
+def extract_footer_weeks(text):
+    """Wyciąga oficjalny zbiór dat dla TN i TP ze stopki dokumentu."""
+    tn_dates = set()
+    tp_dates = set()
+
+    for line in text.splitlines():
+        line_clean = line.strip()
+        if "TN – tygodnie nieparzyste" in line_clean or "TN -" in line_clean:
+            after_colon = line_clean.split(":", 1)[-1]
+            tn_dates.update(parse_date_ranges(after_colon))
+        elif "TP – tygodnie parzyste" in line_clean or "TP -" in line_clean:
+            after_colon = line_clean.split(":", 1)[-1]
+            tp_dates.update(parse_date_ranges(after_colon))
+
+    return tn_dates, tp_dates
+
+def parse_explicit_dates(text, default_year=2026):
+    """
+    Wyciąga daty z dopisku 'ter.: 18,25.11; 2,9,16.12; 10.01' lub 'ter.: 2,16.10; 13,27.11; 8.01;'
+    """
+    dates = []
+    ter_match = re.search(r'ter\.?:\s*([^\n\r]+)', text, re.IGNORECASE)
+    if not ter_match:
+        return dates
+
+    raw_part = ter_match.group(1).split("Aula")[0].strip()
+    # Szukamy fragmentów typu '18,25.11' lub '8.01'
+    segments = re.findall(r'([\d\s,]+)\.(\d{1,2})', raw_part)
+    for days_str, month_str in segments:
+        m = int(month_str)
+        yr = default_year if m >= 9 else default_year + 1
+        day_numbers = re.findall(r'\d+', days_str)
+        for d in day_numbers:
+            try:
+                dates.append(date(yr, m, int(d)))
+            except ValueError:
+                pass
+    return dates
+
+def extract_time_from_str(text):
     m = re.search(r'(\d{1,2})[\.:](\d{2})\s*[-–]\s*(\d{1,2})[\.:](\d{2})', text)
     if m:
         return time(int(m.group(1)), int(m.group(2))), time(int(m.group(3)), int(m.group(4)))
     return None, None
 
-def clean_subject_text(text):
-    """Czyści tekst komórki z powtórzonych godzin czy śmieci."""
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
-    cleaned = []
-    for l in lines:
-        # Usuń linie będące samymi godzinami
-        if re.match(r'^\d{1,2}[\.:]\d{2}\s*[-–]\s*\d{1,2}[\.:]\d{2}$', l):
-            continue
-        cleaned.append(l)
-    return " ".join(cleaned)
+def clean_subject(text):
+    # Usunięcie godzin na początku wpisu, jeśli występują
+    cleaned = re.sub(r'^\d{1,2}[\.:]\d{2}\s*[-–]\s*\d{1,2}[\.:]\d{2}\s*', '', text.strip())
+    # Usunięcie powtórzonych spacji i nowych linii
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    return cleaned
 
-def parse_pdf(file_path):
-    cal = Calendar()
-    cal.add('prodid', '-//ANS Konin Schedule Parser//EN')
-    cal.add('version', '2.0')
+def parse_schedule():
+    with pdfplumber.open(LOCAL_PDF) as pdf:
+        full_text = "\n".join([page.extract_text() or "" for page in pdf.pages])
+        tn_dates, tp_dates = extract_footer_weeks(full_text)
+        all_semester_dates = tn_dates.union(tp_dates)
 
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            tables = page.extract_tables({
-                "vertical_strategy": "lines",
-                "horizontal_strategy": "lines",
-                "snap_tolerance": 3,
-                "join_tolerance": 3,
-            })
+        cal = Calendar()
+        cal.add('prodid', '-//ANS Konin AiR Calendar//PL')
+        cal.add('version', '2.0')
 
-            # Jeśli standardowe linie nie wykryją tabeli, fallback na 'text'
-            if not tables:
-                tables = page.extract_tables()
+        page = pdf.pages[0]
+        # Wyciągamy tabele bez narzucania sztywnych linii pionowych (obsługa komórek scalonych)
+        tables = page.extract_tables()
 
-            for table in tables:
-                if not table or len(table) < 2:
+        current_day = None
+
+        for table in tables:
+            for row in table:
+                if not row or not any(row):
                     continue
 
-                # Szukamy wiersza nagłówka z dniami tygodnia
-                header_idx = -1
-                col_day_map = {}
+                # Normalizacja komórek
+                cells = [c.strip() if c else "" for c in row]
+                first_col = cells[0].lower()
 
-                for r_idx, row in enumerate(table):
-                    row_str = " ".join([str(c or '').lower() for c in row])
-                    matched_days = [d for d in DAYS if d in row_str]
-                    if len(matched_days) >= 2:
-                        header_idx = r_idx
-                        # Mapuj indeks kolumny na dzień tygodnia (0=Poniedziałek, 4=Piątek)
-                        for c_idx, cell in enumerate(row):
-                            c_text = (cell or '').lower()
-                            for d_num, d_name in enumerate(DAYS):
-                                if d_name in c_text:
-                                    col_day_map[c_idx] = d_num
+                # Ignorowanie nagłówków i stopki
+                if "kierunek" in first_col or "plan zajęć" in first_col or "tn – tygodnie" in first_col:
+                    continue
+
+                # Sprawdzenie czy wiersz określa dzień tygodnia
+                for d_name, d_id in DAY_NAMES.items():
+                    if d_name in first_col:
+                        current_day = d_id
                         break
 
-                if header_idx == -1:
+                if current_day is None:
                     continue
 
-                # Przechodzimy po kolejnych wierszach z zajęciami
-                for row in table[header_idx + 1:]:
-                    if not row or not any(row):
-                        continue
-
-                    # Sprawdź, czy wiersz nie jest stopką z legendą
-                    first_cell = str(row[0] or '')
-                    if "tygodnie" in first_cell.lower() or "legenda" in first_cell.lower():
-                        continue
-
-                    # Pierwsza lub druga kolumna zazwyczaj zawiera godziny
-                    row_time_start, row_time_end = None, None
-                    for c in row[:2]:
-                        s, e = parse_time_range(str(c or ''))
+                # Sprawdzenie domyślnej godziny z wiersza (np. w kolumnie 1 lub 0)
+                row_start, row_end = None, None
+                for col_idx in [0, 1]:
+                    if col_idx < len(cells):
+                        s, e = extract_time_from_str(cells[col_idx])
                         if s and e:
-                            row_time_start, row_time_end = s, e
+                            row_start, row_end = s, e
                             break
 
-                    # Przeglądamy kolumny z dniami
-                    for c_idx, cell in enumerate(row):
-                        if c_idx not in col_day_map or not cell:
-                            continue
+                if not row_start:
+                    continue
 
-                        cell_text = cell.strip()
-                        if len(cell_text) < 4:  # ignorujemy puste/pojedyncze znaki typu "k"
-                            continue
+                # Komórki z zajęciami (od kolumny 1 wzwyż)
+                subject_cells = set()
+                for c in cells[1:]:
+                    if not c:
+                        continue
+                    # Pomijamy komórkę będącą wyłącznie samą godziną
+                    if re.match(r'^\d{1,2}[\.:]\d{2}\s*[-–]\s*\d{1,2}[\.:]\d{2}$', c.strip()):
+                        continue
+                    subject_cells.add(c)
 
-                        weekday = col_day_map[c_idx]
+                for cell_content in subject_cells:
+                    if len(cell_content) < 4:
+                        continue
 
-                        # Czy wewnątrz komórki jest nadpisana inna godzina?
-                        cell_start, cell_end = parse_time_range(cell_text)
-                        t_start = cell_start or row_time_start
-                        t_end = cell_end or row_time_end
+                    # Sprawdzamy czy komórka nadpisuje godziny (np. 10.00-11.30 Siłownia)
+                    custom_start, custom_end = extract_time_from_str(cell_content)
+                    start_time = custom_start or row_start
+                    end_time = custom_end or row_end
 
-                        if not t_start or not t_end:
-                            continue
+                    # Wyznaczenie konkretnych dat
+                    explicit = parse_explicit_dates(cell_content)
+                    if explicit:
+                        target_dates = explicit
+                    else:
+                        is_tn = bool(re.search(r'\bTN\b', cell_content))
+                        is_tp = bool(re.search(r'\bTP\b', cell_content))
 
-                        cleaned_title = clean_subject_text(cell_text)
-                        explicit_dates = parse_explicit_dates(cell_text)
-
-                        # Jeśli są jawnie wpisane terminy (ter.: ...)
-                        if explicit_dates:
-                            target_dates = explicit_dates
+                        if is_tn:
+                            target_dates = [d for d in tn_dates if d.weekday() == current_day]
+                        elif is_tp:
+                            target_dates = [d for d in tp_dates if d.weekday() == current_day]
                         else:
-                            # Generuj cotygodniowe zajęcia dla danego dnia tygodnia
-                            target_dates = []
-                            cur = SEMESTER_START
-                            # Dopasuj do pierwszego wystąpienia danego dnia tygodnia
-                            cur += timedelta(days=(weekday - cur.weekday()) % 7)
+                            # Zajęcia odbywające się co tydzień
+                            target_dates = [d for d in all_semester_dates if d.weekday() == current_day]
 
-                            is_tn = " TN " in f" {cell_text} " or "TN" in cell_text
-                            is_tp = " TP " in f" {cell_text} " or "TP" in cell_text
+                    title = clean_subject(cell_content)
 
-                            week_counter = 1
-                            while cur <= SEMESTER_END:
-                                # Uproszczona parzystość: co 2 tygodnie jeśli zaznaczono TN/TP
-                                if is_tn and (week_counter % 2 != 1):
-                                    pass
-                                elif is_tp and (week_counter % 2 != 0):
-                                    pass
-                                else:
-                                    target_dates.append(cur)
-                                cur += timedelta(days=7)
-                                week_counter += 1
+                    for event_date in sorted(target_dates):
+                        event = Event()
+                        event.add('summary', title)
+                        event.add('dtstart', TZ.localize(datetime.combine(event_date, start_time)))
+                        event.add('dtend', TZ.localize(datetime.combine(event_date, end_time)))
+                        cal.add_component(event)
 
-                        for d in target_dates:
-                            ev = Event()
-                            ev.add('summary', cleaned_title)
-                            ev.add('dtstart', TZ.localize(datetime.combine(d, t_start)))
-                            ev.add('dtend', TZ.localize(datetime.combine(d, t_end)))
-                            cal.add_component(ev)
-
-    with open(OUTPUT_ICS, 'wb') as f:
-        f.write(cal.to_ical())
-    print(f"Pomyślnie wygenerowano plik: {OUTPUT_ICS}")
+        with open(OUTPUT_ICS, 'wb') as f:
+            f.write(cal.to_ical())
+        print(f"Wygenerowano poprawny plik {OUTPUT_ICS}")
 
 if __name__ == "__main__":
     download_pdf(PDF_URL, LOCAL_PDF)
-    parse_pdf(LOCAL_PDF)
+    parse_schedule()
