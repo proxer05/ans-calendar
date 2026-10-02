@@ -5,12 +5,20 @@ that can be imported into Google Calendar.
 
 How the PDF is interpreted
 --------------------------
+The page is a ruled table, so the text is rebuilt from glyph positions rather
+than from pdfplumber's plain reading order (the weekday names are rotated, see
+`PDF -> normalised text` below).  The result is one line per table row.
+
 * Day headers:  Poniedziałek / Wtorek / Środa / Czwartek / Piątek ...
 * Entry lines:  "<grid slot> [<real time>] Subject - teacher - wyk. TN 109t"
     - if a line has two time ranges, the LAST one is the real class time
       (the first one is just the grid row label)
     - TN / TP    -> odd / even weeks, dates come from the legend at the bottom
-    - ter.: ...  -> explicit list of dates, e.g. "18,25.11; 2,9,16.12"
+    - ter.: ...  -> explicit list of dates, e.g. "18,25.11; 2,9,16.12; 10".
+                    Segments are chronological, so a segment carrying only a
+                    day number ("...; 10") is placed in the surrounding
+                    series: first by month rollover, then - if that lands on
+                    the wrong weekday - by continuing the series cadence.
     - no marker  -> every teaching day (union of the TN and TP legend dates,
                     so free days / holidays are skipped automatically)
     - room       -> tokens like 109t, 17t, Aula
@@ -46,13 +54,140 @@ SINGLE_RE = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{4})")
 
 
 # --------------------------------------------------------------------------
-# PDF -> text
+# PDF -> normalised text
+#
+# The plan is a ruled table: a narrow "Godz." column with the grid slot times
+# followed by one block of rows per weekday.  The weekday names are printed
+# rotated by -90 degrees, which makes plain extract_text() shred them into
+# single letters ("k", "e", "ła", "iz") and scatter them through the body
+# text, so no day header is ever recognised.  The text is therefore rebuilt
+# from glyph positions instead:
+#
+#   * the drawn horizontal rules give the row bands,
+#   * the rotated glyph runs give the weekday labels and where each block sits,
+#   * every band becomes one line, read left to right, so the grid slot time
+#     comes first and the real class time (when it differs) comes second,
+#     which is exactly what parse_text() expects.
 # --------------------------------------------------------------------------
+CONTENT_RE = re.compile(rf"^\s*{TIME}")
+
+
+def _is_horizontal(obj) -> bool:
+    """pdfplumber's char.upright only knows about page rotation, so look at
+    the text matrix itself: horizontal text has a non-zero x scale."""
+    m = obj.get("matrix")
+    if m is None:
+        return True
+    return abs(m[0]) > 0.5 or abs(m[1]) < 0.5
+
+
+def _cluster_lines(words: list[dict], tol: float = 2.0) -> list[dict]:
+    """Group words into visual text lines by their top coordinate."""
+    rows: list[dict] = []
+    for w in sorted(words, key=lambda w: (w["top"], w["x0"])):
+        for row in rows:
+            if abs(w["top"] - row["top"]) <= tol:
+                row["words"].append(w)
+                row["top"] = sum(x["top"] for x in row["words"]) / len(row["words"])
+                break
+        else:
+            rows.append({"top": w["top"], "words": [w]})
+    return sorted(rows, key=lambda r: r["top"])
+
+
+def _line_text(row: dict) -> str:
+    return " ".join(w["text"] for w in sorted(row["words"], key=lambda w: w["x0"]))
+
+
+def _horizontal_rules(page) -> list[float]:
+    """Y positions of the table's horizontal rules, de-duplicated."""
+    wide = page.width * 0.15
+    tops = [round(r["top"], 2) for r in page.rects
+            if r["x1"] - r["x0"] > wide and r["bottom"] - r["top"] <= 3.0]
+    tops += [round(e["top"], 2) for e in page.edges
+             if e["orientation"] == "h" and abs(e["x1"] - e["x0"]) > wide]
+    out: list[float] = []
+    for t in sorted(tops):
+        if not out or t - out[-1] > 2.0:
+            out.append(t)
+    return out
+
+
+def _rotated_labels(page) -> list[dict]:
+    """Vertical (rotated -90 deg) labels: text plus the vertical span they cover."""
+    rot = [c for c in page.chars if not _is_horizontal(c)]
+    cols: list[list[dict]] = []
+    for c in sorted(rot, key=lambda c: c["x0"]):
+        if cols and abs(cols[-1][0]["x0"] - c["x0"]) < 3.0:
+            cols[-1].append(c)
+        else:
+            cols.append([c])
+
+    out = []
+    for col in cols:
+        # glyphs of one label sit within a couple of font sizes of each other,
+        # neighbouring labels are far apart
+        limit = 2.0 * max(c["size"] for c in col)
+        col.sort(key=lambda c: -c["top"])  # rotated text reads bottom-up
+        runs: list[list[dict]] = []
+        for c in col:
+            prev = runs[-1][-1] if runs else None
+            if prev is not None and 0.0 <= prev["top"] - c["top"] <= limit:
+                runs[-1].append(c)
+            else:
+                runs.append([c])
+        for run in runs:
+            txt = "".join(c["text"] for c in run).strip()
+            if not txt:
+                continue
+            lo = min(c["top"] for c in run)
+            hi = max(c["bottom"] for c in run)
+            out.append({"text": txt, "top": lo, "bottom": hi, "center": (lo + hi) / 2})
+    return out
+
+
+def _layout_page(page) -> list[str]:
+    rules = _horizontal_rules(page)
+    heads = [h for h in _rotated_labels(page) if h["text"].lower() in DAYS]
+    if not rules:
+        # not a ruled table - fall back to the plain reading order
+        page = page.filter(lambda o: _is_horizontal(o) if "text" in o else True)
+        return [_line_text(r) for r in _cluster_lines(page.extract_words())]
+
+    page = page.filter(lambda o: _is_horizontal(o) if "text" in o else True)
+    words = page.extract_words()
+    lines = [_line_text(r) for r in _cluster_lines(
+        [w for w in words if w["bottom"] <= rules[0] + 1])]
+
+    cur: dict | None = None
+    for top, bot in zip(rules, rules[1:]):
+        cw = [w for w in words if top - 1 <= (w["top"] + w["bottom"]) / 2 <= bot + 1]
+        if not cw:
+            continue
+        rows = [_line_text(r) for r in _cluster_lines(cw)]
+        # weekday labels are centred on their block of rows; the header row
+        # ("Godz.") belongs to no weekday, so only re-anchor on real entries
+        if heads and CONTENT_RE.match(rows[0]):
+            near = min(heads, key=lambda h: abs(h["center"] - (top + bot) / 2))
+            if cur is None or near["text"] != cur["text"]:
+                if cur is None or near["center"] > cur["center"]:
+                    lines.append(near["text"])
+                    cur = near
+        lines.extend(rows)
+
+    lines += [_line_text(r) for r in _cluster_lines(
+        [w for w in words if w["top"] >= rules[-1] - 1])]
+    return lines
+
+
 def pdf_to_text(path: str) -> str:
     import pdfplumber
 
+    out: list[str] = []
     with pdfplumber.open(path) as pdf:
-        return "\n".join((page.extract_text() or "") for page in pdf.pages)
+        for page in pdf.pages:
+            out.extend(_layout_page(page))
+    return "\n".join(out)
 
 
 # --------------------------------------------------------------------------
@@ -82,23 +217,82 @@ def parse_legend_dates(s: str) -> set[date]:
     return out
 
 
-def parse_terms(s: str, acad_year: int, warnings: list[str]) -> set[date]:
-    """'18,25.11; 2,9,16.12; 8.01' -> set of dates (Sep-Dec = start year)."""
+def _resolve_bare_day(day: int, prev: date | None, prev_day: int,
+                      prev_month: int, gaps: list[int], expect_wd: int,
+                      warnings: list[str], seg: str) -> date | None:
+    """Resolve a 'ter.:' segment that is only a day number, e.g. '...; 10'.
+
+    The PDF sometimes drops the month ("2,9,16.12; 10") or garbles it.  Two
+    readings are tried: the usual month rollover - the author merely left the
+    month out - and, if that lands on the wrong weekday, carrying on with the
+    cadence of the surrounding series (weekly lists step by 7 days).  Falling
+    back is always reported, because it means the PDF itself is inconsistent.
+    """
+    if prev is not None and 1 <= day <= 31:
+        year, month = prev.year, prev_month
+        if day <= prev_day:  # the list moved on to the next month
+            month += 1
+            if month > 12:
+                month, year = 1, year + 1
+        try:
+            cand = date(year, month, day)
+        except ValueError:  # e.g. 30.02
+            cand = None
+        if cand is not None and cand.weekday() == expect_wd and cand > prev:
+            return cand
+    if prev is not None and gaps:
+        step = max(set(gaps), key=gaps.count)
+        nxt = prev + timedelta(days=step)
+        if nxt.weekday() == expect_wd:
+            warnings.append(
+                f"'ter.:' segment {seg!r} has no usable month and lands on the "
+                f"wrong weekday - continued the series as {nxt:%d.%m.%Y}")
+            return nxt
+    warnings.append(
+        f"Cannot resolve date segment {seg!r} in 'ter.:' list - skipped")
+    return None
+
+
+def parse_terms(s: str, acad_year: int, expect_wd: int,
+                warnings: list[str]) -> set[date]:
+    """'18,25.11; 2,9,16.12; 8.01' -> set of dates (Sep-Dec = start year).
+
+    Segments are chronological, which lets a bare day number be placed in the
+    surrounding series.  expect_wd is the weekday the class actually meets on.
+    """
     out: set[date] = set()
+    prev: date | None = None
+    prev_day = prev_month = 0
+    gaps: list[int] = []
+
     for seg in s.split(";"):
         seg = seg.strip()
         if not seg:
             continue
         m = re.fullmatch(r"([\d,\s]+)\.(\d{1,2})\.?(?:(\d{4}))?", seg)
-        if not m:
-            warnings.append(f"Cannot parse date segment {seg!r} in 'ter.:' list")
+        if m:
+            month = int(m.group(2))
+            year = int(m.group(3)) if m.group(3) else (
+                acad_year if month >= 9 else acad_year + 1
+            )
+            for d in sorted(int(x) for x in re.findall(r"\d+", m.group(1))):
+                cur = date(year, month, d)
+                if prev is not None and cur > prev:
+                    gaps.append((cur - prev).days)
+                prev, prev_day, prev_month = cur, d, month
+                out.add(cur)
             continue
-        month = int(m.group(2))
-        year = int(m.group(3)) if m.group(3) else (
-            acad_year if month >= 9 else acad_year + 1
-        )
-        for d in re.findall(r"\d+", m.group(1)):
-            out.add(date(year, month, int(d)))
+        if seg.isdigit():
+            cur = _resolve_bare_day(int(seg), prev, prev_day, prev_month,
+                                    gaps, expect_wd, warnings, seg)
+            if cur is None:
+                continue
+            if prev is not None and cur > prev:
+                gaps.append((cur - prev).days)
+            prev = cur
+            out.add(cur)
+            continue
+        warnings.append(f"Cannot parse date segment {seg!r} in 'ter.:' list")
     return out
 
 
@@ -123,6 +317,7 @@ def parse_text(text: str, fb_start: date | None, fb_end: date | None):
     legend_key: str | None = None
     raw: list[dict] = []
     day: int | None = None
+    saw_day = False
 
     for ln in lines:
         stripped = ln.strip()
@@ -134,13 +329,15 @@ def parse_text(text: str, fb_start: date | None, fb_end: date | None):
             legend_key = lm.group(1)
             legend[legend_key] += " " + lm.group(2)
             continue
-        if legend_key:  # wrapped legend line
+        if legend_key and re.match(r"^[\d\s,;.–-]", stripped):
+            # wrapped legend line, but do not swallow real content after it
             legend[legend_key] += " " + stripped
             continue
 
         low = stripped.lower().rstrip(":")
         if low in DAYS:
             day = DAYS[low]
+            saw_day = True
             continue
         if day is None:
             continue
@@ -153,6 +350,11 @@ def parse_text(text: str, fb_start: date | None, fb_end: date | None):
 
     parity = {k: parse_legend_dates(v) for k, v in legend.items()}
     all_days = parity["TN"] | parity["TP"]
+
+    if not saw_day and any(TIME_RE.match(ln.strip()) for ln in lines):
+        warnings.append(
+            "No weekday header found - the PDF layout may have changed, "
+            "check --dump-text")
 
     if acad_year is None:
         acad_year = min(all_days).year if all_days else date.today().year
@@ -216,7 +418,7 @@ def parse_text(text: str, fb_start: date | None, fb_end: date | None):
         subject, teacher = parts[0], ", ".join(parts[1:])
 
         if terms_raw:
-            dates = sorted(parse_terms(terms_raw, acad_year, warnings))
+            dates = sorted(parse_terms(terms_raw, acad_year, r["day"], warnings))
             for d in dates:
                 if d.weekday() != r["day"]:
                     warnings.append(
