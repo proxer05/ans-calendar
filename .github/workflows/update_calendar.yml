@@ -1,64 +1,48 @@
-name: Update Schedule Calendar
+name: Timetable PDF -> ICS
 
 on:
-  schedule:
-    - cron: '0 5 * * 1'
   workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * 1"   # every Monday 05:00 UTC - picks up changes to the PDF
 
 permissions:
-  contents: write
+  contents: write         # needed to commit plan.ics back to the repo
+
+env:
+  PLAN_URL: "https://ans.konin.pl/images/MiA/AiR%20plany%202026_2027/plan%20automatyka%201.pdf"
+  CAL_NAME: "AiR rok I sem I 2026/27"
 
 jobs:
-  build-and-release:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.12"
+          cache: pip
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pdfplumber icalendar pytz
+        run: pip install -r requirements.txt
 
-      - name: Run calendar parser
-        run: |
-          python parse_schedule.py
+      - name: Download PDF
+        run: curl -fsSL --retry 3 -o plan.pdf "$PLAN_URL"
 
-      - name: Upload ICS as Artifact
+      - name: Build plan.ics
+        run: python scripts/plan_to_ics.py plan.pdf -o plan.ics --dump-text plan.txt --calname "$CAL_NAME"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: google-calendar-ics
-          path: plan_automatyka_1.ics
+          name: plan-ics
+          path: |
+            plan.ics
+            plan.txt
 
-      - name: Update or Create GitHub Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Commit plan.ics if changed
         run: |
-          # Sprawdź czy plik został poprawnie wygenerowany
-          if [ ! -f "plan_automatyka_1.ics" ]; then
-            echo "Error: plan_automatyka_1.ics not found!"
-            exit 1
-          fi
-
-          TAG="latest-schedule"
-          TITLE="Latest ANS Konin AiR Schedule"
-
-          # Sprawdzenie czy Release już istnieje
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Updating existing release..."
-            # --clobber wymusza nadpisanie pliku o tej samej nazwie
-            gh release upload "$TAG" plan_automatyka_1.ics --clobber
-            gh release edit "$TAG" --title "$TITLE" --notes "Updated on $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          else
-            echo "Creating new release..."
-            gh release create "$TAG" plan_automatyka_1.ics \
-              --title "$TITLE" \
-              --notes "Generated automatically on $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add plan.ics
+          git diff --cached --quiet || (git commit -m "Update timetable ICS" && git push)
