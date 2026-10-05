@@ -69,10 +69,24 @@ python plan_to_ics.py plan.pdf -o plan.ics --dump-text plan.txt --calname "AiR r
 `plan.txt` is the layout-normalised text the parser sees — useful when the
 university changes the PDF and the event count suddenly drops.
 
-## Known source typo
+## How `ter.:` is read
 
-The PDF's own legend for *Metody i języki programowania* ends with a bare `10`
-(`ter.: 18,25.11; 2,9,16.12; 10`). That can only be a 23 December, since 10
-January 2027 is a Sunday. The parser continues the weekly series as
-**23.12.2026** and prints a warning. Every run reports this, so it stays
-visible rather than silently becoming a hardcoded date.
+Rows that meet on specific dates carry them inline, and the list ends with the
+classroom:
+
+```
+ter.: 18,25.11; 2,9,16.12; 10     ->  five dates, in sala 10
+```
+
+Every date carries a month and every `ter.:` list in both published plans ends
+in a room (`10`, `18t`, `19t`, `113t`, `204t`, `Aula`), so a trailing segment
+without a dot is the room.
+
+This matters because the two readings look identical and produce different
+calendars. Reading `10` as a date — the natural first guess, since it follows
+`2,9,16.12` — yields a sixth session on 23.12, which the university never
+listed. The parser treats it as the room instead, so *Metody i języki
+programowania* appears on 18.11, 25.11, 2.12, 9.12 and 16.12 and nothing else.
+
+A room is never guessed and a date is never invented: if a `ter.:` list cannot
+be read, the run warns and says so rather than inventing a plausible date.

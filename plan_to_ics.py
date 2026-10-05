@@ -14,14 +14,14 @@ than from pdfplumber's plain reading order (the weekday names are rotated, see
     - if a line has two time ranges, the LAST one is the real class time
       (the first one is just the grid row label)
     - TN / TP    -> odd / even weeks, dates come from the legend at the bottom
-    - ter.: ...  -> explicit list of dates, e.g. "18,25.11; 2,9,16.12; 10".
-                    Segments are chronological, so a segment carrying only a
-                    day number ("...; 10") is placed in the surrounding
-                    series: first by month rollover, then - if that lands on
-                    the wrong weekday - by continuing the series cadence.
+    - ter.: ...  -> explicit list of dates followed by the classroom, e.g.
+                    "18,25.11; 2,9,16.12; 10" means those five dates, in
+                    sala 10.  Every "ter.:" list in these plans ends with the
+                    room and every date carries a month, so a trailing
+                    segment without a dot is read as the room, not a date.
     - no marker  -> every teaching day (union of the TN and TP legend dates,
                     so free days / holidays are skipped automatically)
-    - room       -> tokens like 109t, 17t, Aula
+    - room       -> tokens like 109t, 17t, 10, Aula
 * Legend lines: "TN – tygodnie nieparzyste: 1-2.10.2026; 12-16.10.2026; ..."
 
 Usage
@@ -44,6 +44,8 @@ DAYS = {
 TIME = r"\d{1,2}[.:]\d{2}\s*-\s*\d{1,2}[.:]\d{2}"
 TIME_RE = re.compile(rf"^\s*({TIME})\s*")
 ROOM_RE = re.compile(r"\b(\d{1,3}t|Aula)\b")
+# A whole 'ter.:' segment with no month in it is the classroom, not a date.
+ROOM_SEGMENT_RE = re.compile(r"\A(?:\d{1,3}t|Aula|\d{1,3})\Z")
 TYPE_TOKEN = r"(?:wyk|ćw|lab|konw|proj|sem)\."
 TYPE_RE = re.compile(rf"({TYPE_TOKEN}(?:\s*/\s*{TYPE_TOKEN})*)")
 LEGEND_RE = re.compile(r"^\s*(TN|TP)\s*[–-]\s*[^:]*:\s*(.*)$")
@@ -217,53 +219,17 @@ def parse_legend_dates(s: str) -> set[date]:
     return out
 
 
-def _resolve_bare_day(day: int, prev: date | None, prev_day: int,
-                      prev_month: int, gaps: list[int], expect_wd: int,
-                      warnings: list[str], seg: str) -> date | None:
-    """Resolve a 'ter.:' segment that is only a day number, e.g. '...; 10'.
+def parse_terms(s: str, acad_year: int,
+                warnings: list[str]) -> tuple[set[date], str]:
+    """'18,25.11; 2,9,16.12; 10' -> ({18.11, 25.11, 2.12, 9.12, 16.12}, '10').
 
-    The PDF sometimes drops the month ("2,9,16.12; 10") or garbles it.  Two
-    readings are tried: the usual month rollover - the author merely left the
-    month out - and, if that lands on the wrong weekday, carrying on with the
-    cadence of the surrounding series (weekly lists step by 7 days).  Falling
-    back is always reported, because it means the PDF itself is inconsistent.
-    """
-    if prev is not None and 1 <= day <= 31:
-        year, month = prev.year, prev_month
-        if day <= prev_day:  # the list moved on to the next month
-            month += 1
-            if month > 12:
-                month, year = 1, year + 1
-        try:
-            cand = date(year, month, day)
-        except ValueError:  # e.g. 30.02
-            cand = None
-        if cand is not None and cand.weekday() == expect_wd and cand > prev:
-            return cand
-    if prev is not None and gaps:
-        step = max(set(gaps), key=gaps.count)
-        nxt = prev + timedelta(days=step)
-        if nxt.weekday() == expect_wd:
-            warnings.append(
-                f"'ter.:' segment {seg!r} has no usable month and lands on the "
-                f"wrong weekday - continued the series as {nxt:%d.%m.%Y}")
-            return nxt
-    warnings.append(
-        f"Cannot resolve date segment {seg!r} in 'ter.:' list - skipped")
-    return None
-
-
-def parse_terms(s: str, acad_year: int, expect_wd: int,
-                warnings: list[str]) -> set[date]:
-    """'18,25.11; 2,9,16.12; 8.01' -> set of dates (Sep-Dec = start year).
-
-    Segments are chronological, which lets a bare day number be placed in the
-    surrounding series.  expect_wd is the weekday the class actually meets on.
+    The trailing segment is the classroom, not a date: in both published plans
+    every 'ter.:' list ends with a room ("...; 10", "...; 113t", "...; Aula")
+    and every date carries a month, so a segment without a dot cannot be a
+    date.  It is returned separately instead of being guessed at.
     """
     out: set[date] = set()
-    prev: date | None = None
-    prev_day = prev_month = 0
-    gaps: list[int] = []
+    room = ""
 
     for seg in s.split(";"):
         seg = seg.strip()
@@ -276,24 +242,19 @@ def parse_terms(s: str, acad_year: int, expect_wd: int,
                 acad_year if month >= 9 else acad_year + 1
             )
             for d in sorted(int(x) for x in re.findall(r"\d+", m.group(1))):
-                cur = date(year, month, d)
-                if prev is not None and cur > prev:
-                    gaps.append((cur - prev).days)
-                prev, prev_day, prev_month = cur, d, month
-                out.add(cur)
+                out.add(date(year, month, d))
             continue
-        if seg.isdigit():
-            cur = _resolve_bare_day(int(seg), prev, prev_day, prev_month,
-                                    gaps, expect_wd, warnings, seg)
-            if cur is None:
-                continue
-            if prev is not None and cur > prev:
-                gaps.append((cur - prev).days)
-            prev = cur
-            out.add(cur)
+        rm = ROOM_SEGMENT_RE.match(seg)
+        if rm:
+            if room:
+                warnings.append(
+                    f"'ter.:' list has more than one room ({room!r}, {seg!r}) "
+                    f"- kept {room!r}")
+            else:
+                room = seg
             continue
         warnings.append(f"Cannot parse date segment {seg!r} in 'ter.:' list")
-    return out
+    return out, room
 
 
 # --------------------------------------------------------------------------
@@ -418,7 +379,10 @@ def parse_text(text: str, fb_start: date | None, fb_end: date | None):
         subject, teacher = parts[0], ", ".join(parts[1:])
 
         if terms_raw:
-            dates = sorted(parse_terms(terms_raw, acad_year, r["day"], warnings))
+            dates, term_room = parse_terms(terms_raw, acad_year, warnings)
+            if not room:
+                room = term_room
+            dates = sorted(dates)
             for d in dates:
                 if d.weekday() != r["day"]:
                     warnings.append(
