@@ -90,3 +90,14 @@ programowania* appears on 18.11, 25.11, 2.12, 9.12 and 16.12 and nothing else.
 
 A room is never guessed and a date is never invented: if a `ter.:` list cannot
 be read, the run warns and says so rather than inventing a plausible date.
+
+## Stray fragment in the source PDF
+
+The current PDF carries a lone `12.10.2026;` text object just above the TN
+legend, left behind when the university edited it (that same edit added a year
+to every legend entry). It has no time of its own, so it attaches to the empty
+grid row before it.
+
+The parser rejects any row with no subject text, so it is skipped with a
+warning instead of becoming an event literally named `12.10.2026;`. Nothing is
+lost: the TN legend already lists `12-16.10.2026`.

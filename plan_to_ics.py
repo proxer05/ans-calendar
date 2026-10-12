@@ -341,6 +341,13 @@ def parse_text(text: str, fb_start: date | None, fb_end: date | None):
         body = " ".join(rest.split())
         if not body:
             continue  # empty grid row
+        if not any(ch.isalpha() for ch in body):
+            # The current PDF carries a stray "12.10.2026;" just above the TN
+            # legend, left over from an edit.  It has no time, so it is appended
+            # to the empty grid row before it; without this it becomes an event
+            # literally called "12.10.2026;".  A subject always has letters.
+            warnings.append(f"Skipped line with no subject text: {body!r}")
+            continue
         h1, m1, h2, m2 = clean_time(times[-1])
 
         terms_raw = None
