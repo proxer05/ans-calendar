@@ -4,7 +4,7 @@ Converts the published timetable PDF into an iCalendar feed that Google Calendar
 and Apple Calendar can subscribe to, so the schedule updates itself instead of
 being re-imported by hand every time the university changes it.
 
-Updates run every Monday 05:00 UTC and also on demand via **Actions →
+Updates run every day at 05:00 UTC and also on demand via **Actions →
 Timetable PDF -> ICS → Run workflow**.
 
 ## Subscribe

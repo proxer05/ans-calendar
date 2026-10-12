@@ -3,7 +3,7 @@ name: Timetable PDF -> ICS
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 5 * * 1"   # every Monday 05:00 UTC - picks up changes to the PDF
+    - cron: "0 5 * * *"   # every day 05:00 UTC - picks up changes to the PDF
 
 permissions:
   contents: write         # needed to publish the release assets
